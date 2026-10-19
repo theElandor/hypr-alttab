@@ -1,0 +1,947 @@
+#!/usr/bin/env python3
+"""hypr-alttab: a Windows-style Alt+Tab window switcher for Hyprland.
+
+Runs as a small daemon that listens on a unix socket for commands sent by
+`hypr-alttab-ctl` (bound to Alt+Tab in hyprland.conf):
+
+    next     start the switcher / move selection forward
+    prev     start the switcher / move selection backward
+    commit   focus the selected window and close the switcher
+    cancel   close the switcher without switching
+    quit     stop the daemon
+
+While open, the switcher grabs the keyboard, so it sees the Alt release
+itself (which commits, exactly like Windows), plus Tab/Shift+Tab, arrows,
+Enter, Escape and Delete (closes the selected window). Clicking a preview
+switches to it.
+"""
+
+import argparse
+import configparser
+import json
+import math
+import os
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GtkLayerShell", "0.1")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import Gdk, Gio, GLib, Gtk, GtkLayerShell, Pango, PangoCairo  # noqa: E402
+
+try:  # GLib >= 2.86 moved DesktopAppInfo to GioUnix
+    gi.require_version("GioUnix", "2.0")
+    from gi.repository import GioUnix  # noqa: E402
+    DesktopAppInfo = GioUnix.DesktopAppInfo
+except (ValueError, ImportError):
+    DesktopAppInfo = Gio.DesktopAppInfo
+
+import cairo  # noqa: E402
+
+APP_NAME = "hypr-alttab"
+# Debug aid: keep the switcher open regardless of the modifier state.
+DEBUG_HOLD = os.environ.get("HYPR_ALTTAB_DEBUG_HOLD") == "1"
+HERE = os.path.dirname(os.path.realpath(__file__))
+
+DEFAULTS = {
+    "general": {
+        # all | monitor | workspace
+        "scope": "all",
+        "include_special": "true",
+        # alt | super | ctrl: the key whose release commits the selection
+        "modifier": "alt",
+        # A quick Alt+Tab tap switches without ever showing the switcher
+        "show_delay_ms": "120",
+        # How often previews refresh while the switcher is open (0 = never)
+        "live_refresh_ms": "750",
+        "fade_ms": "110",
+    },
+    "style": {
+        "thumbnail_height": "170",
+        "max_width_fraction": "0.9",
+        "font_size": "10",
+        "panel_color": "#202020d9",
+        "panel_border_color": "#ffffff1f",
+        "tile_hover_color": "#ffffff14",
+        "tile_selected_color": "#ffffff1f",
+        "selection_border_color": "#ffffffff",
+        "text_color": "#ffffffff",
+        "corner_radius": "12",
+    },
+}
+
+MODIFIERS = {
+    "alt": (Gdk.ModifierType.MOD1_MASK, {"Alt_L", "Alt_R", "Meta_L", "Meta_R"}),
+    "super": (Gdk.ModifierType.SUPER_MASK | Gdk.ModifierType.MOD4_MASK, {"Super_L", "Super_R"}),
+    "ctrl": (Gdk.ModifierType.CONTROL_MASK, {"Control_L", "Control_R"}),
+}
+
+# Layout metrics (logical pixels)
+PANEL_PAD = 14
+TILE_PAD = 8
+TILE_GAP = 6
+HEADER_H = 30
+ICON_SIZE = 20
+SEL_BORDER = 3
+TILE_RADIUS = 8
+THUMB_RADIUS = 6
+CLOSE_SIZE = 22
+
+
+def log(*args):
+    print(f"[{APP_NAME}]", *args, file=sys.stderr, flush=True)
+
+
+def parse_color(s):
+    s = s.strip().lstrip("#")
+    if len(s) == 6:
+        s += "ff"
+    r, g, b, a = (int(s[i:i + 2], 16) / 255 for i in range(0, 8, 2))
+    return r, g, b, a
+
+
+def socket_path():
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "default")
+    return os.path.join(runtime, f"{APP_NAME}-{sig}.sock")
+
+
+# --------------------------------------------------------------------------
+# Hyprland IPC
+# --------------------------------------------------------------------------
+
+class Hyprland:
+    def __init__(self):
+        runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+        sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+        if not sig:
+            raise SystemExit(f"{APP_NAME}: HYPRLAND_INSTANCE_SIGNATURE is not set; is Hyprland running?")
+        self.path = os.path.join(runtime, "hypr", sig, ".socket.sock")
+
+    def request(self, cmd):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.connect(self.path)
+            s.sendall(cmd.encode())
+            chunks = []
+            while True:
+                data = s.recv(65536)
+                if not data:
+                    break
+                chunks.append(data)
+        return b"".join(chunks).decode(errors="replace")
+
+    def json(self, what):
+        return json.loads(self.request(f"j/{what}"))
+
+    def dispatch(self, args):
+        return self.request(f"dispatch {args}")
+
+
+# --------------------------------------------------------------------------
+# Icons
+# --------------------------------------------------------------------------
+
+class IconLookup:
+    def __init__(self):
+        self.theme = Gtk.IconTheme.get_default()
+        self.names = {}
+        self.surfaces = {}
+        self.apps = None
+
+    def _all_apps(self):
+        if self.apps is None:
+            self.apps = Gio.AppInfo.get_all()
+        return self.apps
+
+    def icon_name(self, wm_class):
+        if wm_class in self.names:
+            return self.names[wm_class]
+        name = self._resolve(wm_class)
+        self.names[wm_class] = name
+        return name
+
+    def _resolve(self, wm_class):
+        if not wm_class:
+            return "application-x-executable"
+        candidates = [wm_class, wm_class.lower(), wm_class.split(".")[-1].lower(),
+                      wm_class.split("_")[0].lower(), wm_class.split("-")[0].lower()]
+        app = None
+        for c in candidates:
+            try:
+                app = DesktopAppInfo.new(c + ".desktop")
+            except TypeError:
+                app = None
+            if app:
+                break
+        if not app:
+            lc = wm_class.lower()
+            for a in self._all_apps():
+                wmc = a.get_startup_wm_class() if hasattr(a, "get_startup_wm_class") else None
+                if wmc and wmc.lower() == lc:
+                    app = a
+                    break
+        if not app:
+            for group in DesktopAppInfo.search(wm_class.split("_")[0]):
+                for app_id in group:
+                    try:
+                        app = DesktopAppInfo.new(app_id)
+                    except TypeError:
+                        app = None
+                    if app:
+                        break
+                if app:
+                    break
+        if app and app.get_icon():
+            icon = app.get_icon()
+            if isinstance(icon, Gio.ThemedIcon):
+                for n in icon.get_names():
+                    if self.theme.has_icon(n):
+                        return n
+            elif isinstance(icon, Gio.FileIcon):
+                return icon.get_file().get_path()
+        for c in candidates:
+            if self.theme.has_icon(c):
+                return c
+        return "application-x-executable"
+
+    def surface(self, wm_class, size, scale):
+        key = (wm_class, size, scale)
+        if key in self.surfaces:
+            return self.surfaces[key]
+        name = self.icon_name(wm_class)
+        pixbuf = None
+        try:
+            if name.startswith("/"):
+                from gi.repository import GdkPixbuf
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(name, size * scale, size * scale)
+            else:
+                pixbuf = self.theme.load_icon_for_scale(name, size, scale, Gtk.IconLookupFlags.FORCE_SIZE)
+        except GLib.Error:
+            try:
+                pixbuf = self.theme.load_icon_for_scale("application-x-executable", size, scale,
+                                                        Gtk.IconLookupFlags.FORCE_SIZE)
+            except GLib.Error:
+                pixbuf = None
+        surf = Gdk.cairo_surface_create_from_pixbuf(pixbuf, scale, None) if pixbuf else None
+        self.surfaces[key] = surf
+        return surf
+
+
+# --------------------------------------------------------------------------
+# Thumbnail capture
+# --------------------------------------------------------------------------
+
+def find_capture_helper():
+    for p in (os.path.join(HERE, "build", "hypr-alttab-capture"),
+              os.path.join(HERE, "hypr-alttab-capture")):
+        if os.access(p, os.X_OK):
+            return p
+    return shutil.which("hypr-alttab-capture")
+
+
+def run_capture(helper, addresses, max_dim):
+    """Runs the helper and returns {address: (w, h, bytes)}."""
+    try:
+        out = subprocess.run([helper, str(max_dim), *addresses], capture_output=True,
+                             timeout=3).stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log("capture failed:", e)
+        return {}
+    result = {}
+    off = 0
+    while off + 16 <= len(out):
+        addr, w, h = struct.unpack_from("=QII", out, off)
+        off += 16
+        n = w * h * 4
+        if off + n > len(out):
+            break
+        result[f"0x{addr:x}"] = (w, h, out[off:off + n])
+        off += n
+    return result
+
+
+# --------------------------------------------------------------------------
+# Switcher UI
+# --------------------------------------------------------------------------
+
+class Tile:
+    __slots__ = ("win", "x", "y", "w", "h", "thumb_w", "thumb_h")
+
+
+class Switcher:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        g = cfg["general"]
+        st = cfg["style"]
+        self.scope = g.get("scope")
+        self.include_special = g.getboolean("include_special")
+        self.mod_mask, self.mod_keys = MODIFIERS.get(g.get("modifier").lower(), MODIFIERS["alt"])
+        self.show_delay = g.getint("show_delay_ms")
+        self.live_refresh = g.getint("live_refresh_ms")
+        self.fade_ms = max(1, g.getint("fade_ms"))
+        self.thumb_h = st.getint("thumbnail_height")
+        self.max_w_frac = st.getfloat("max_width_fraction")
+        self.font_size = st.getfloat("font_size")
+        self.c_panel = parse_color(st.get("panel_color"))
+        self.c_panel_border = parse_color(st.get("panel_border_color"))
+        self.c_hover = parse_color(st.get("tile_hover_color"))
+        self.c_selected = parse_color(st.get("tile_selected_color"))
+        self.c_sel_border = parse_color(st.get("selection_border_color"))
+        self.c_text = parse_color(st.get("text_color"))
+        self.panel_radius = st.getint("corner_radius")
+
+        self.hypr = Hyprland()
+        self.icons = IconLookup()
+        self.helper = find_capture_helper()
+        if not self.helper:
+            log("hypr-alttab-capture not found; previews disabled (run `make`)")
+
+        self.active = False
+        self.revealed = False
+        self.windows = []
+        self.tiles = []
+        self.sel = 0
+        self.hover = -1
+        self.hover_close = False
+        self.thumbs = {}  # address -> (cairo.ImageSurface, buffer), kept across invocations
+        self.capturing = False
+        self.generation = 0
+        self.reveal_time = 0.0
+        self.timers = []
+        self.panel_w = self.panel_h = 1
+        self.monitor_scale = 1
+
+        self.window = Gtk.Window()
+        self.window.set_app_paintable(True)
+        visual = self.window.get_screen().get_rgba_visual()
+        if visual:
+            self.window.set_visual(visual)
+        GtkLayerShell.init_for_window(self.window)
+        GtkLayerShell.set_namespace(self.window, APP_NAME)
+        GtkLayerShell.set_layer(self.window, GtkLayerShell.Layer.OVERLAY)
+        GtkLayerShell.set_keyboard_mode(self.window, GtkLayerShell.KeyboardMode.EXCLUSIVE)
+        GtkLayerShell.set_exclusive_zone(self.window, -1)
+
+        self.area = Gtk.DrawingArea()
+        self.area.add_events(Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.BUTTON_PRESS_MASK
+                             | Gdk.EventMask.BUTTON_RELEASE_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK
+                             | Gdk.EventMask.SCROLL_MASK)
+        self.area.connect("draw", self.on_draw)
+        self.area.connect("motion-notify-event", self.on_motion)
+        self.area.connect("leave-notify-event", self.on_leave)
+        self.area.connect("button-press-event", self.on_button)
+        self.area.connect("scroll-event", self.on_scroll)
+        self.window.add(self.area)
+        self.window.connect("key-press-event", self.on_key_press)
+        self.window.connect("key-release-event", self.on_key_release)
+        self.window.connect("focus-in-event", self.on_focus_in)
+
+    # ---- window list -----------------------------------------------------
+
+    def collect_windows(self):
+        clients = self.hypr.json("clients")
+        monitors = self.hypr.json("monitors")
+        focused_mon = next((m for m in monitors if m.get("focused")), monitors[0] if monitors else None)
+        wins = []
+        for c in clients:
+            if not c.get("mapped"):
+                continue
+            # Hidden windows are inactive group members; keep those, drop the rest.
+            if c.get("hidden") and not c.get("grouped"):
+                continue
+            if not c.get("class") and not c.get("title"):
+                continue
+            ws = c.get("workspace", {})
+            special = ws.get("id", 0) < 0 or str(ws.get("name", "")).startswith("special")
+            if special and not self.include_special:
+                continue
+            if self.scope == "monitor" and focused_mon and c.get("monitor") != focused_mon["id"]:
+                continue
+            if self.scope == "workspace" and focused_mon and \
+                    ws.get("id") != focused_mon.get("activeWorkspace", {}).get("id"):
+                continue
+            wins.append(c)
+        wins.sort(key=lambda c: c.get("focusHistoryID", 1 << 30))
+        return wins, focused_mon
+
+    # ---- commands ----------------------------------------------------------
+
+    def command(self, cmd):
+        if DEBUG_HOLD:
+            log("command", cmd, "active" if self.active else "idle", "sel", self.sel, "n", len(self.windows))
+        if cmd in ("next", "prev"):
+            if self.active:
+                self.step(1 if cmd == "next" else -1)
+                if not self.revealed:
+                    self.reveal()
+            else:
+                self.open(cmd == "next")
+        elif cmd == "commit":
+            self.commit()
+        elif cmd == "cancel":
+            self.close()
+        elif cmd == "quit":
+            self.close()
+            Gtk.main_quit()
+        else:
+            log("unknown command:", cmd)
+
+    def open(self, forward):
+        try:
+            wins, mon = self.collect_windows()
+        except (OSError, ValueError) as e:
+            log("hyprland IPC failed:", e)
+            return
+        if not wins:
+            return
+        self.windows = wins
+        n = len(wins)
+        if n == 1:
+            self.sel = 0
+        else:
+            self.sel = 1 if forward else n - 1
+        self.hover = -1
+        self.hover_close = False
+        self.active = True
+        self.revealed = False
+        self.generation += 1
+
+        self.place_on_monitor(mon)
+        self.layout()
+        self.window.set_size_request(self.panel_w, self.panel_h)
+        self.window.resize(self.panel_w, self.panel_h)
+        self.window.show_all()
+
+        gen = self.generation
+        self.add_timer(max(0, self.show_delay), lambda: self.reveal() if gen == self.generation else None)
+        self.capture()
+
+    def place_on_monitor(self, mon):
+        display = Gdk.Display.get_default()
+        target = None
+        if mon:
+            for i in range(display.get_n_monitors()):
+                gm = display.get_monitor(i)
+                geo = gm.get_geometry()
+                if geo.x == mon["x"] and geo.y == mon["y"]:
+                    target = gm
+                    break
+        if target is None:
+            target = display.get_monitor(0)
+        GtkLayerShell.set_monitor(self.window, target)
+        geo = target.get_geometry()
+        self.mon_w, self.mon_h = geo.width, geo.height
+        self.monitor_scale = target.get_scale_factor()
+
+    def step(self, delta):
+        if not self.windows:
+            return
+        self.sel = (self.sel + delta) % len(self.windows)
+        self.area.queue_draw()
+
+    def reveal(self):
+        if not self.active or self.revealed:
+            return
+        self.revealed = True
+        self.reveal_time = time.monotonic()
+        self.area.queue_draw()
+        GLib.timeout_add(16, self._fade_tick, self.generation)
+        if self.live_refresh > 0:
+            GLib.timeout_add(self.live_refresh, self._refresh_tick, self.generation)
+
+    def _fade_tick(self, gen):
+        if gen != self.generation or not self.active:
+            return False
+        self.area.queue_draw()
+        return (time.monotonic() - self.reveal_time) * 1000 < self.fade_ms
+
+    def _refresh_tick(self, gen):
+        if gen != self.generation or not self.active:
+            return False
+        self.capture()
+        return True
+
+    def commit(self):
+        if not self.active:
+            return
+        win = self.windows[self.sel] if 0 <= self.sel < len(self.windows) else None
+        self.close()
+        if win:
+            # Let the layer surface give keyboard focus back before refocusing.
+            GLib.idle_add(self._focus, win["address"])
+
+    def _focus(self, address):
+        try:
+            self.hypr.dispatch(f"focuswindow address:{address}")
+            self.hypr.dispatch("alterzorder top")
+        except OSError as e:
+            log("focus failed:", e)
+        return False
+
+    def close(self):
+        if not self.active:
+            return
+        self.active = False
+        self.revealed = False
+        self.generation += 1
+        for t in self.timers:
+            GLib.source_remove(t)
+        self.timers.clear()
+        self.window.hide()
+
+    def close_window(self, index):
+        if not (0 <= index < len(self.windows)):
+            return
+        win = self.windows.pop(index)
+        try:
+            self.hypr.dispatch(f"closewindow address:{win['address']}")
+        except OSError as e:
+            log("close failed:", e)
+        if not self.windows:
+            self.close()
+            return
+        if self.sel >= len(self.windows):
+            self.sel = len(self.windows) - 1
+        self.hover = -1
+        self.layout()
+        self.window.set_size_request(self.panel_w, self.panel_h)
+        self.window.resize(self.panel_w, self.panel_h)
+        self.area.queue_draw()
+
+    def add_timer(self, ms, fn):
+        def cb():
+            if tid in self.timers:
+                self.timers.remove(tid)
+            fn()
+            return False
+        tid = GLib.timeout_add(ms, cb)
+        self.timers.append(tid)
+
+    # ---- capture -------------------------------------------------------------
+
+    def capture(self):
+        if not self.helper or self.capturing or not self.windows:
+            return
+        self.capturing = True
+        addresses = [w["address"] for w in self.windows]
+        max_dim = int(math.ceil(self.thumb_h * 1.9 * self.monitor_scale))
+        helper = self.helper
+
+        def worker():
+            result = run_capture(helper, addresses, max_dim)
+            GLib.idle_add(self._capture_done, result)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _capture_done(self, result):
+        self.capturing = False
+        for addr, (w, h, data) in result.items():
+            buf = bytearray(data)
+            surf = cairo.ImageSurface.create_for_data(buf, cairo.FORMAT_ARGB32, w, h, w * 4)
+            # Keep the backing store alive as long as the surface.
+            self.thumbs[addr] = (surf, buf)
+        # Forget thumbnails of windows that no longer exist (bounded cache).
+        if len(self.thumbs) > 64:
+            live = {w["address"] for w in self.windows}
+            for k in list(self.thumbs):
+                if k not in live:
+                    del self.thumbs[k]
+        if self.active:
+            old = (self.panel_w, self.panel_h)
+            self.layout()
+            if (self.panel_w, self.panel_h) != old:
+                self.window.set_size_request(self.panel_w, self.panel_h)
+                self.window.resize(self.panel_w, self.panel_h)
+            self.area.queue_draw()
+        return False
+
+    # ---- layout ----------------------------------------------------------------
+
+    def aspect(self, win):
+        t = self.thumbs.get(win["address"])
+        if t:
+            w, h = t[0].get_width(), t[0].get_height()
+        else:
+            w, h = win.get("size", [16, 9])
+        if w <= 0 or h <= 0:
+            return 16 / 9
+        return min(max(w / h, 0.5), 2.4)
+
+    def layout(self):
+        max_w = int(self.mon_w * self.max_w_frac)
+        max_h = int(self.mon_h * 0.85)
+        th = self.thumb_h
+        while True:
+            rows = self._flow(th, max_w)
+            row_h = th + HEADER_H + TILE_PAD * 2
+            total_h = len(rows) * row_h + (len(rows) - 1) * TILE_GAP + PANEL_PAD * 2
+            if total_h <= max_h or th <= 60:
+                break
+            th = int(th * 0.85)
+        row_widths = [sum(t.w for t in r) + TILE_GAP * (len(r) - 1) for r in rows]
+        inner_w = max(row_widths) if row_widths else 0
+        self.panel_w = max(inner_w + PANEL_PAD * 2, 200)
+        self.panel_h = total_h
+        y = PANEL_PAD
+        self.tiles = []
+        for r, rw in zip(rows, row_widths):
+            x = (self.panel_w - rw) // 2
+            for t in r:
+                t.x, t.y = x, y
+                x += t.w + TILE_GAP
+                self.tiles.append(t)
+            y += row_h + TILE_GAP
+
+    def _flow(self, th, max_w):
+        rows, row, row_w = [], [], 0
+        inner_max = max_w - PANEL_PAD * 2
+        for win in self.windows:
+            t = Tile()
+            t.win = win
+            t.thumb_h = th
+            t.thumb_w = int(th * self.aspect(win))
+            t.w = max(t.thumb_w, int(th * 0.9)) + TILE_PAD * 2
+            t.h = th + HEADER_H + TILE_PAD * 2
+            extra = t.w + (TILE_GAP if row else 0)
+            if row and row_w + extra > inner_max:
+                rows.append(row)
+                row, row_w = [], 0
+                extra = t.w
+            row.append(t)
+            row_w += extra
+        if row:
+            rows.append(row)
+        return rows
+
+    def tile_at(self, x, y):
+        for i, t in enumerate(self.tiles):
+            if t.x <= x < t.x + t.w and t.y <= y < t.y + t.h:
+                return i
+        return -1
+
+    def close_rect(self, t):
+        return (t.x + t.w - TILE_PAD - CLOSE_SIZE + 2, t.y + (HEADER_H + TILE_PAD - CLOSE_SIZE) // 2 + 1,
+                CLOSE_SIZE, CLOSE_SIZE)
+
+    # ---- drawing -----------------------------------------------------------------
+
+    @staticmethod
+    def rounded(cr, x, y, w, h, r):
+        r = min(r, w / 2, h / 2)
+        cr.new_sub_path()
+        cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+        cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+        cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+        cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+        cr.close_path()
+
+    def on_draw(self, widget, cr):
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+        if not self.active or not self.revealed:
+            return True
+
+        alpha = min(1.0, (time.monotonic() - self.reveal_time) * 1000 / self.fade_ms)
+        alpha = 1 - (1 - alpha) ** 3  # ease-out
+        cr.push_group()
+
+        w, h = self.panel_w, self.panel_h
+        self.rounded(cr, 0.5, 0.5, w - 1, h - 1, self.panel_radius)
+        cr.set_source_rgba(*self.c_panel)
+        cr.fill_preserve()
+        cr.set_source_rgba(*self.c_panel_border)
+        cr.set_line_width(1)
+        cr.stroke()
+
+        scale = widget.get_scale_factor()
+        for i, t in enumerate(self.tiles):
+            self.draw_tile(cr, i, t, scale)
+
+        cr.pop_group_to_source()
+        cr.paint_with_alpha(alpha)
+        return True
+
+    def draw_tile(self, cr, i, t, scale):
+        selected = i == self.sel
+        hovered = i == self.hover
+        if selected or hovered:
+            self.rounded(cr, t.x, t.y, t.w, t.h, TILE_RADIUS)
+            cr.set_source_rgba(*(self.c_selected if selected else self.c_hover))
+            cr.fill()
+        if selected:
+            b = SEL_BORDER
+            self.rounded(cr, t.x + b / 2, t.y + b / 2, t.w - b, t.h - b, TILE_RADIUS)
+            cr.set_source_rgba(*self.c_sel_border)
+            cr.set_line_width(b)
+            cr.stroke()
+
+        win = t.win
+        # Header: icon + title (+ close button on hover/selection)
+        icon = self.icons.surface(win.get("class", ""), ICON_SIZE, scale)
+        hx = t.x + TILE_PAD + 2
+        hy = t.y + TILE_PAD
+        if icon:
+            cr.set_source_surface(icon, hx, hy + (HEADER_H - TILE_PAD - ICON_SIZE) / 2)
+            cr.paint()
+        show_close = hovered or selected
+        text_x = hx + ICON_SIZE + 8
+        text_w = t.x + t.w - TILE_PAD - text_x - (CLOSE_SIZE + 4 if show_close else 2)
+        layout = PangoCairo.create_layout(cr)
+        font = Pango.FontDescription.from_string(Gtk.Settings.get_default().get_property("gtk-font-name"))
+        font.set_size(int(self.font_size * Pango.SCALE))
+        layout.set_font_description(font)
+        layout.set_text(win.get("title") or win.get("class") or "", -1)
+        layout.set_width(max(1, int(text_w)) * Pango.SCALE)
+        layout.set_ellipsize(Pango.EllipsizeMode.END)
+        layout.set_single_paragraph_mode(True)
+        _, logical = layout.get_pixel_extents()
+        cr.set_source_rgba(*self.c_text)
+        cr.move_to(text_x, hy + (HEADER_H - TILE_PAD - logical.height) / 2)
+        PangoCairo.show_layout(cr, layout)
+
+        if show_close:
+            cx, cy, cw, ch = self.close_rect(t)
+            if hovered and self.hover_close:
+                self.rounded(cr, cx, cy, cw, ch, 4)
+                cr.set_source_rgba(0.77, 0.17, 0.11, 1)
+                cr.fill()
+            cr.set_source_rgba(*self.c_text)
+            cr.set_line_width(1.2)
+            m = 7
+            cr.move_to(cx + m, cy + m)
+            cr.line_to(cx + cw - m, cy + ch - m)
+            cr.move_to(cx + cw - m, cy + m)
+            cr.line_to(cx + m, cy + ch - m)
+            cr.stroke()
+
+        # Thumbnail
+        area_x = t.x + TILE_PAD
+        area_y = t.y + TILE_PAD + HEADER_H - 2
+        area_w = t.w - TILE_PAD * 2
+        area_h = t.thumb_h
+        thumb = self.thumbs.get(win["address"], (None,))[0]
+        if thumb:
+            tw, th = thumb.get_width(), thumb.get_height()
+            s = min(area_w / tw, area_h / th)
+            dw, dh = tw * s, th * s
+            dx = area_x + (area_w - dw) / 2
+            dy = area_y + (area_h - dh) / 2
+            cr.save()
+            self.rounded(cr, dx, dy, dw, dh, THUMB_RADIUS)
+            cr.clip()
+            cr.translate(dx, dy)
+            cr.scale(s, s)
+            cr.set_source_surface(thumb, 0, 0)
+            cr.get_source().set_filter(cairo.FILTER_GOOD)
+            cr.paint()
+            cr.restore()
+        else:
+            # No preview available (yet): app icon on a soft backdrop, like Windows
+            # does for minimized windows.
+            self.rounded(cr, area_x, area_y, area_w, area_h, THUMB_RADIUS)
+            cr.set_source_rgba(1, 1, 1, 0.05)
+            cr.fill()
+            big = min(64, int(area_h * 0.5))
+            bicon = self.icons.surface(win.get("class", ""), big, scale)
+            if bicon:
+                cr.set_source_surface(bicon, area_x + (area_w - big) / 2, area_y + (area_h - big) / 2)
+                cr.paint()
+
+    # ---- input ---------------------------------------------------------------------
+
+    def modifier_held(self):
+        if DEBUG_HOLD:
+            return True
+        keymap = Gdk.Keymap.get_for_display(Gdk.Display.get_default())
+        return bool(keymap.get_modifier_state() & self.mod_mask)
+
+    def on_focus_in(self, *_):
+        # If the modifier was already released before we grabbed the keyboard
+        # (a quick Alt+Tab tap), switch immediately.
+        gen = self.generation
+
+        def check():
+            if gen == self.generation and self.active and not self.modifier_held():
+                self.commit()
+            return False
+        GLib.timeout_add(30, check)
+        return False
+
+    def on_key_press(self, _w, ev):
+        name = Gdk.keyval_name(ev.keyval) or ""
+        shift = bool(ev.state & Gdk.ModifierType.SHIFT_MASK)
+        if name == "Tab":
+            self.step(-1 if shift else 1)
+        elif name == "ISO_Left_Tab":
+            self.step(-1)
+        elif name in ("Right", "l"):
+            self.step(1)
+        elif name in ("Left", "h"):
+            self.step(-1)
+        elif name in ("Down", "Up", "j", "k"):
+            self.step_vertical(1 if name in ("Down", "j") else -1)
+        elif name in ("Return", "KP_Enter", "space"):
+            self.commit()
+            return True
+        elif name == "Escape":
+            self.close()
+            return True
+        elif name == "Delete":
+            self.close_window(self.sel)
+            return True
+        else:
+            return True
+        if not self.revealed:
+            self.reveal()
+        return True
+
+    def step_vertical(self, direction):
+        if not self.tiles:
+            return
+        cur = self.tiles[self.sel]
+        cx = cur.x + cur.w / 2
+        best, best_d = None, None
+        for i, t in enumerate(self.tiles):
+            if (t.y - cur.y) * direction <= 0:
+                continue
+            d = abs(t.y - cur.y) * 10000 + abs(t.x + t.w / 2 - cx)
+            if best_d is None or d < best_d:
+                best, best_d = i, d
+        if best is not None:
+            self.sel = best
+            self.area.queue_draw()
+
+    def on_key_release(self, _w, ev):
+        name = Gdk.keyval_name(ev.keyval) or ""
+        if name in self.mod_keys and not DEBUG_HOLD:
+            self.commit()
+        return True
+
+    def on_motion(self, _w, ev):
+        if not self.revealed:
+            return False
+        i = self.tile_at(ev.x, ev.y)
+        hc = False
+        if i >= 0:
+            cx, cy, cw, ch = self.close_rect(self.tiles[i])
+            hc = cx <= ev.x < cx + cw and cy <= ev.y < cy + ch
+        if i != self.hover or hc != self.hover_close:
+            self.hover = i
+            self.hover_close = hc
+            self.area.queue_draw()
+        return False
+
+    def on_leave(self, *_):
+        if self.hover != -1:
+            self.hover = -1
+            self.area.queue_draw()
+        return False
+
+    def on_button(self, _w, ev):
+        if ev.type != Gdk.EventType.BUTTON_PRESS or not self.revealed:
+            return True
+        i = self.tile_at(ev.x, ev.y)
+        if i < 0:
+            return True
+        if ev.button == 2 or (ev.button == 1 and self.hover_close and i == self.hover):
+            self.close_window(i)
+        elif ev.button == 1:
+            self.sel = i
+            self.commit()
+        return True
+
+    def on_scroll(self, _w, ev):
+        if ev.direction == Gdk.ScrollDirection.UP:
+            self.step(-1)
+        elif ev.direction == Gdk.ScrollDirection.DOWN:
+            self.step(1)
+        elif ev.direction == Gdk.ScrollDirection.SMOOTH:
+            _, dx, dy = ev.get_scroll_deltas()
+            if dy:
+                self.step(1 if dy > 0 else -1)
+        return True
+
+
+# --------------------------------------------------------------------------
+# Control socket
+# --------------------------------------------------------------------------
+
+def serve(switcher, path):
+    if os.path.exists(path):
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.connect(path)
+            raise SystemExit(f"{APP_NAME}: already running ({path})")
+        except ConnectionRefusedError:
+            os.unlink(path)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(path)
+    os.chmod(path, 0o600)
+    srv.listen(8)
+    srv.setblocking(False)
+
+    def on_conn(*_):
+        try:
+            conn, _addr = srv.accept()
+        except BlockingIOError:
+            return True
+        with conn:
+            conn.settimeout(0.5)
+            try:
+                data = conn.recv(256).decode(errors="replace").strip()
+            except OSError:
+                data = ""
+        for cmd in data.split():
+            switcher.command(cmd)
+        return True
+
+    # Must not be PRIORITY_HIGH: showing the layer surface from a high-priority
+    # callback deadlocks GTK's Wayland event handling.
+    GLib.io_add_watch(srv.fileno(), GLib.PRIORITY_DEFAULT, GLib.IO_IN, on_conn)
+    return srv
+
+
+def load_config(path):
+    cfg = configparser.ConfigParser()
+    cfg.read_dict(DEFAULTS)
+    if path and os.path.exists(path):
+        cfg.read(path)
+    return cfg
+
+
+def main():
+    default_cfg = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+                               APP_NAME, "config.ini")
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-c", "--config", default=default_cfg, help=f"config file (default: {default_cfg})")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    switcher = Switcher(cfg)
+    path = socket_path()
+    srv = serve(switcher, path)
+    log("listening on", path)
+    try:
+        Gtk.main()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.close()
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+if __name__ == "__main__":
+    main()
