@@ -2,6 +2,8 @@
 
 A Windows-style **Alt+Tab** window switcher for [Hyprland](https://hyprland.org), with live window previews.
 
+![hypr-alttab switching between windows](assets/screenshot.png)
+
 - Hold **Alt**, tap **Tab** to walk through windows, **release Alt** to switch.
 - Windows are listed in most-recently-used order, and the selection starts on the previous window, like on Windows.
 - A quick Alt+Tab tap switches to the previous window instantly, without flashing the switcher.
